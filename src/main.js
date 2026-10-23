@@ -1,3 +1,6 @@
+import '@fontsource/nunito/latin-700.css';
+import '@fontsource/nunito/latin-800.css';
+import '@fontsource/nunito/latin-900.css';
 import './style.css';
 import { Game } from './game.js';
 
@@ -7,10 +10,9 @@ if (!canvas) {
   throw new Error('Game canvas not found');
 }
 
-// Boot the game
-const game = new Game(canvas);
-
-// Expose for debugging in local development
-if (import.meta.env.DEV) {
-  window.__fruitPopFusion = game;
+if (window.__fruitPopFusion?.destroy) {
+  window.__fruitPopFusion.destroy();
 }
+
+const game = new Game(canvas);
+window.__fruitPopFusion = game;

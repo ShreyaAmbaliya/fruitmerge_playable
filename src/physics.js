@@ -1,30 +1,31 @@
 import Matter from 'matter-js';
 import { FRUITS } from './fruit.js';
 
-const { Engine, World, Bodies, Body, Events, Composite, Query } = Matter;
+const { Engine, World, Bodies, Body, Events } = Matter;
 
 /**
  * Matter.js world wrapper for the fruit jar.
+ * Fruits are always dynamic. Static bodies then toggled back to dynamic
+ * keep an invalid mass in Matter.js and never fall.
  */
 export class PhysicsWorld {
   constructor() {
     this.engine = Engine.create({
-      gravity: { x: 0, y: 0.95 },
-      enableSleeping: true,
+      gravity: { x: 0, y: 1 },
+      enableSleeping: false,
     });
-    this.engine.timing.timeScale = 1;
+    this.engine.enableSleeping = false;
     this.world = this.engine.world;
 
-    // Higher iterations for stable stacking / less tunneling
     this.engine.positionIterations = 10;
     this.engine.velocityIterations = 8;
 
     this.walls = [];
-    this.fruits = new Map(); // body.id -> { body, level, mergeLocked, settled }
+    this.fruits = new Map(); // body.id -> meta
     this.pendingMerges = [];
-    this.mergePairs = new Set();
-    this.onMerge = null;
+    this._pendingKeys = new Set();
     this._collisionBound = false;
+    this._acc = 0;
 
     this.bounds = { left: 0, right: 0, top: 0, bottom: 0, wall: 14 };
   }
@@ -85,49 +86,78 @@ export class PhysicsWorld {
         if (fa.level !== fb.level) continue;
         if (fa.mergeLocked || fb.mergeLocked) continue;
         if (!fa.canMerge || !fb.canMerge) continue;
-
-        // Stable pair key (order-independent)
-        const key = a.id < b.id ? `${a.id}-${b.id}` : `${b.id}-${a.id}`;
-        if (this.mergePairs.has(key)) continue;
-        this.mergePairs.add(key);
-
-        this.pendingMerges.push({
-          a: fa,
-          b: fb,
-          x: (a.position.x + b.position.x) / 2,
-          y: (a.position.y + b.position.y) / 2,
-          level: fa.level,
-        });
+        this._queueMerge(fa, fb);
       }
     });
   }
 
-  createFruit(level, x, y, { isStatic = false, canMerge = true } = {}) {
+  _pairKey(a, b) {
+    const ia = a.body.id;
+    const ib = b.body.id;
+    return ia < ib ? `${ia}-${ib}` : `${ib}-${ia}`;
+  }
+
+  _queueMerge(a, b) {
+    if (!a || !b || a === b) return;
+    if (a.mergeLocked || b.mergeLocked) return;
+    if (a.level !== b.level) return;
+    const key = this._pairKey(a, b);
+    if (this._pendingKeys.has(key)) return;
+    this._pendingKeys.add(key);
+    this.pendingMerges.push({
+      a,
+      b,
+      x: (a.body.position.x + b.body.position.x) / 2,
+      y: (a.body.position.y + b.body.position.y) / 2,
+      level: a.level,
+    });
+  }
+
+  /**
+   * Same-level fruits that are already touching (including ones spawned
+   * overlapping) are queued even if collisionStart already fired.
+   */
+  queueContactMerges() {
+    const list = this.getFruitList();
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i];
+      if (!a.canMerge || a.mergeLocked) continue;
+      const ra = FRUITS[a.level].radius;
+      for (let j = i + 1; j < list.length; j++) {
+        const b = list[j];
+        if (!b.canMerge || b.mergeLocked) continue;
+        if (a.level !== b.level) continue;
+        const dx = a.body.position.x - b.body.position.x;
+        const dy = a.body.position.y - b.body.position.y;
+        const reach = (ra + FRUITS[b.level].radius) * 1.02;
+        if (dx * dx + dy * dy <= reach * reach) this._queueMerge(a, b);
+      }
+    }
+  }
+
+  createFruit(level, x, y, { canMerge = true, mergeDelay = 0 } = {}) {
     const def = FRUITS[level];
     const radius = def.radius;
+    const density = 0.002 + level * 0.00035;
     const body = Bodies.circle(x, y, radius, {
-      isStatic: false,
-      restitution: 0.1,
-      friction: 0.4,
-      frictionAir: 0.02,
-      density: 0.002 + level * 0.0003,
+      restitution: 0.08,
+      friction: 0.45,
+      frictionAir: 0.012,
+      density,
       label: 'fruit',
-      sleepThreshold: 60,
-      slop: 0.04,
+      slop: 0.02,
     });
 
-    // Cap max speed to reduce tunneling through jar walls
-    body.plugin = body.plugin || {};
-
-    if (isStatic) {
-      Body.setStatic(body, true);
+    if (!Number.isFinite(body.mass)) {
+      Body.setMass(body, Math.PI * radius * radius * density);
     }
 
     const meta = {
       body,
       level,
       mergeLocked: false,
-      canMerge,
+      canMerge: mergeDelay > 0 ? false : canMerge,
+      mergeAt: mergeDelay > 0 ? performance.now() + mergeDelay : 0,
       bornAt: performance.now(),
       scaleX: 1,
       scaleY: 1,
@@ -170,30 +200,66 @@ export class PhysicsWorld {
     }
 
     this.pendingMerges = [];
-    // Prune mergePairs for removed bodies later; clear stale keys periodically
-    if (this.mergePairs.size > 200) this.mergePairs.clear();
+    this._pendingKeys.clear();
 
     return results;
   }
 
-  clearMergeLocks() {
-    // no-op placeholder; locks are permanent until body removal
+  /** Enable merging once each fruit's spawn delay has elapsed. */
+  unlockMerges(now = performance.now()) {
+    for (const meta of this.fruits.values()) {
+      if (!meta.canMerge && meta.mergeAt && now >= meta.mergeAt) {
+        meta.canMerge = true;
+      }
+    }
   }
 
   update(deltaMs) {
-    // Cap delta to avoid spiral of death / tunneling on tab blur
-    const capped = Math.min(deltaMs, 1000 / 45);
-    Engine.update(this.engine, capped);
+    const step = 1000 / 60;
+    this._acc += Math.min(Math.max(deltaMs, 0), 48);
+    let steps = 0;
+    while (this._acc >= step && steps < 3) {
+      Engine.update(this.engine, step);
+      this._acc -= step;
+      steps += 1;
+    }
 
-    // Soft speed clamp
+    const { left, right, bottom } = this.bounds;
     for (const meta of this.fruits.values()) {
-      const v = meta.body.velocity;
+      const body = meta.body;
+      const radius = FRUITS[meta.level].radius;
+      const v = body.velocity;
       const speed = Math.hypot(v.x, v.y);
-      if (speed > 18) {
-        Body.setVelocity(meta.body, {
-          x: (v.x / speed) * 18,
-          y: (v.y / speed) * 18,
-        });
+      if (speed > 16) {
+        Body.setVelocity(body, { x: (v.x / speed) * 16, y: (v.y / speed) * 16 });
+      }
+
+      // Keep fruit inside the jar if a fast step ever tunnels past a wall.
+      const minX = left + radius;
+      const maxX = right - radius;
+      const maxY = bottom - radius;
+      let x = body.position.x;
+      let y = body.position.y;
+      let vx = body.velocity.x;
+      let vy = body.velocity.y;
+      let corrected = false;
+      if (x < minX) {
+        x = minX;
+        vx = Math.abs(vx) * 0.2;
+        corrected = true;
+      } else if (x > maxX) {
+        x = maxX;
+        vx = -Math.abs(vx) * 0.2;
+        corrected = true;
+      }
+      if (y > maxY) {
+        y = maxY;
+        vy = -Math.abs(vy) * 0.15;
+        corrected = true;
+      }
+      if (corrected) {
+        Body.setPosition(body, { x, y });
+        Body.setVelocity(body, { x: vx, y: vy });
       }
     }
   }
@@ -204,7 +270,8 @@ export class PhysicsWorld {
     }
     this.fruits.clear();
     this.pendingMerges = [];
-    this.mergePairs.clear();
+    this._pendingKeys.clear();
+    this._acc = 0;
   }
 
   getFruitList() {
@@ -240,4 +307,4 @@ export class PhysicsWorld {
   }
 }
 
-export { Matter, Body, Query, Composite };
+export { Matter, Body };

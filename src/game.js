@@ -28,6 +28,7 @@ export class Game {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
+    this._alive = true;
     this.dpr = Math.min(window.devicePixelRatio || 1, 2);
 
     this.physics = new PhysicsWorld();
@@ -43,10 +44,10 @@ export class Game {
     this.currentLevel = randomSpawnLevel();
     this.nextLevel = randomSpawnLevel();
     this.dropX = DESIGN_W / 2;
-    this.dropping = null; // fruit meta currently falling from drop
-    this.dropCooldown = false;
+    this.dropping = null; // visual preview only — not a physics body
+    this.dropReadyAt = 0;
     this.dangerTimer = 0;
-    this.dangerGraceMs = 1200;
+    this.dangerGraceMs = 1100;
 
     this.layout = this._computeLayout(DESIGN_W, DESIGN_H);
     this.pointerActive = false;
@@ -70,13 +71,14 @@ export class Game {
   }
 
   _computeLayout(w, h) {
-    const marginX = 28;
-    const jarTop = 110;
-    const jarBottom = h - 90;
+    const marginX = 32;
+    const jarTop = 118;
+    const jarBottom = h - 86;
     const jarLeft = marginX;
     const jarRight = w - marginX;
-    const dangerY = jarTop + 48;
-    const dropY = jarTop + 20;
+    // Danger line sits below the largest fruit that can be dropped.
+    const dangerY = jarTop + 78;
+    const dropY = jarTop + 16;
 
     return {
       w,
@@ -91,7 +93,15 @@ export class Game {
     };
   }
 
+  destroy() {
+    this._alive = false;
+    this.state = 'destroyed';
+    cancelAnimationFrame(this.raf);
+    this.physics.destroy();
+  }
+
   _resize() {
+    if (!this._alive) return;
     const shell = document.getElementById('game-shell');
     const wrap = document.getElementById('canvas-wrap');
     const rect = wrap.getBoundingClientRect();
@@ -279,6 +289,7 @@ export class Game {
   }
 
   startGame() {
+    if (!this._alive) return;
     this.physics.clearFruits();
     this.effects.clear();
     this.score = 0;
@@ -286,7 +297,7 @@ export class Game {
     this.comboTimer = 0;
     this.dangerTimer = 0;
     this.dropping = null;
-    this.dropCooldown = false;
+    this.dropReadyAt = 0;
     this.currentLevel = randomSpawnLevel();
     this.nextLevel = randomSpawnLevel();
     this.dropX = (this.layout.jarLeft + this.layout.jarRight) / 2;
@@ -311,6 +322,7 @@ export class Game {
     this.ui.setPaused(false);
     this.ui.hideOverlays();
     this.lastTs = performance.now();
+    if (!this.dropping) this._spawnPreview();
   }
 
   _spawnPreview() {
@@ -336,106 +348,93 @@ export class Game {
 
   tryDrop() {
     if (this.state !== STATES.PLAYING) return;
-    if (this.dropCooldown) return;
+    if (performance.now() < this.dropReadyAt) return;
     if (!this.dropping?.isPreview) return;
 
     const x = this._clampDropX(this.dropX);
     const y = this.layout.dropY;
     const level = this.dropping.level;
 
-    // Fresh dynamic body — reliable mass / gravity / collisions
     const meta = this.physics.createFruit(level, x, y, {
-      isStatic: false,
       canMerge: false,
+      mergeDelay: 180,
     });
-    Body.setVelocity(meta.body, { x: 0, y: 1.2 });
+    Body.setVelocity(meta.body, { x: 0, y: 0.4 });
     Body.setAngularVelocity(meta.body, (Math.random() - 0.5) * 0.04);
     startDropAnim(meta);
 
-    setTimeout(() => {
-      if (meta && this.physics.fruits.has(meta.body.id)) {
-        meta.canMerge = true;
-      }
-    }, 140);
-
     this.audio.playDrop();
     this.dropping = null;
-    this.dropCooldown = true;
+    this.dropReadyAt = performance.now() + 450;
 
     this.currentLevel = this.nextLevel;
     this.nextLevel = randomSpawnLevel();
     this.ui.drawNext(this.nextLevel);
-
-    setTimeout(() => {
-      this.dropCooldown = false;
-      if (this.state === STATES.PLAYING) this._spawnPreview();
-    }, 420);
   }
 
   _processMerges() {
-    const merges = this.physics.consumeMerges();
-    if (!merges.length) {
-      if (this.comboTimer > 0) {
-        this.comboTimer -= 16;
-        if (this.comboTimer <= 0) this.combo = 0;
-      }
-      return;
-    }
+    let any = false;
 
-    for (const merge of merges) {
-      const { a, b, x, y, level } = merge;
+    for (let wave = 0; wave < 6; wave++) {
+      this.physics.queueContactMerges();
+      const merges = this.physics.consumeMerges();
+      if (!merges.length) break;
+      any = true;
 
-      // Remove the pair
-      this.physics.removeFruit(a);
-      this.physics.removeFruit(b);
+      for (const merge of merges) {
+        const { a, b, x, y, level } = merge;
 
-      const color = FRUITS[level].color;
+        this.physics.removeFruit(a);
+        this.physics.removeFruit(b);
 
-      if (level >= FRUIT_COUNT - 1) {
-        // Two mega melons: celebrate pop, no higher fruit
-        const points = FINAL_POP_POINTS + this.combo * 100;
+        const color = FRUITS[level].color;
+
+        if (level >= FRUIT_COUNT - 1) {
+          // Two Mega Melons pop. There is no fruit beyond the final level.
+          const points = FINAL_POP_POINTS + this.combo * 100;
+          this._addScore(points, x, y);
+          this.effects.celebrate(x, y);
+          this.effects.spawnPopup(x, y - 28, 'Mega Pop!', '#fdcb6e');
+          this.effects.spawnPopup(x, y + 4, `+${points}`, '#e17055');
+          this.audio.playFinal();
+          this.combo += 1;
+          this.comboTimer = 900;
+          continue;
+        }
+
+        const nextLevel = level + 1;
+        const newborn = this.physics.createFruit(nextLevel, x, y, {
+          canMerge: true,
+        });
+        startMergeAnim(newborn);
+        Body.setVelocity(newborn.body, { x: 0, y: -1.2 });
+
+        const base = MERGE_POINTS[nextLevel] || 10;
+        const points = base + this.combo * Math.floor(base * 0.25);
         this._addScore(points, x, y);
-        this.effects.celebrate(x, y);
-        this.effects.spawnPopup(x, y - 20, `+${points}`, '#fdcb6e');
-        this.audio.playFinal();
+        this.effects.spawnParticles(x, y, color, 8 + nextLevel * 2);
+        this.effects.spawnPopup(x, y - FRUITS[nextLevel].radius * 0.6, `+${points}`);
+
+        if (nextLevel === FRUIT_COUNT - 1) {
+          this.effects.celebrate(x, y);
+          this.effects.spawnPopup(x, y - FRUITS[nextLevel].radius - 8, 'Mega Melon!', '#00b894');
+          this.effects.addShake(7);
+          this.audio.playFinal();
+        } else if (this.combo > 0) {
+          this.effects.addShake(2 + Math.min(this.combo, 5));
+          this.audio.playChain(this.combo);
+        } else {
+          this.audio.playMerge(nextLevel);
+        }
+
         this.combo += 1;
         this.comboTimer = 900;
-        continue;
       }
+    }
 
-      const nextLevel = level + 1;
-      const newborn = this.physics.createFruit(nextLevel, x, y, {
-        isStatic: false,
-        canMerge: false,
-      });
-      startMergeAnim(newborn);
-
-      // Brief merge lock so it can settle, then allow chains
-      setTimeout(() => {
-        if (newborn && this.physics.fruits.has(newborn.body.id)) {
-          newborn.canMerge = true;
-        }
-      }, 80);
-
-      const base = MERGE_POINTS[nextLevel] || 10;
-      const points = base + this.combo * Math.floor(base * 0.25);
-      this._addScore(points, x, y);
-      this.effects.spawnParticles(x, y, color, 8 + nextLevel);
-      this.effects.spawnPopup(x, y - FRUITS[nextLevel].radius, `+${points}`);
-
-      if (nextLevel === FRUIT_COUNT - 1) {
-        this.effects.celebrate(x, y);
-        this.effects.addShake(6);
-        this.audio.playFinal();
-      } else if (this.combo > 0) {
-        this.effects.addShake(2 + Math.min(this.combo, 4));
-        this.audio.playChain(this.combo);
-      } else {
-        this.audio.playMerge(nextLevel);
-      }
-
-      this.combo += 1;
-      this.comboTimer = 900;
+    if (!any && this.comboTimer > 0) {
+      this.comboTimer -= 16;
+      if (this.comboTimer <= 0) this.combo = 0;
     }
   }
 
@@ -473,12 +472,15 @@ export class Game {
   }
 
   _loop(ts) {
+    if (!this._alive) return;
     const dt = this.lastTs ? Math.min(ts - this.lastTs, 50) : 16;
     this.lastTs = ts;
 
     if (this.state === STATES.PLAYING) {
+      this.physics.unlockMerges(ts);
       this.physics.update(dt);
       this._processMerges();
+      if (ts >= this.dropReadyAt && !this.dropping) this._spawnPreview();
       this._checkGameOver(dt);
 
       for (const meta of this.physics.getFruitList()) {

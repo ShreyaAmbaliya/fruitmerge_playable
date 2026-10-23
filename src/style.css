@@ -31,6 +31,7 @@ body {
   background: linear-gradient(165deg, var(--bg-top), var(--bg-bottom));
   -webkit-tap-highlight-color: transparent;
   touch-action: none;
+  overscroll-behavior: none;
   user-select: none;
   -webkit-user-select: none;
 }
